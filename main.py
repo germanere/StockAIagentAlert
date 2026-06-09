@@ -1,176 +1,188 @@
 """
-HOSE Stock Webhook Server
-==========================
-- Chạy trên Render / Railway (free tier)
-- Cứ mỗi lần Zapier Schedule trigger → gọi GET /fetch
-- Server lấy giá HOSE → gửi POST đến Zapier Webhook URL
+HOSE Stock Tracker — Direct Google Sheets Writer
+==================================================
+Nguồn dữ liệu: Yahoo Finance (không chặn IP nước ngoài)
 """
 
-import os
-import time
-import logging
+import os, time, logging, json, threading
+from datetime import datetime
 import requests
-from fastapi import FastAPI, BackgroundTasks
-from fastapi.responses import JSONResponse
+import gspread
+from google.oauth2.service_account import Credentials
 from apscheduler.schedulers.background import BackgroundScheduler
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
 # ─────────────────────────────────────────────
-# CONFIG (set qua Environment Variables trên Render/Railway)
+# CONFIG
 # ─────────────────────────────────────────────
 
-ZAPIER_WEBHOOK_URL = os.getenv("ZAPIER_WEBHOOK_URL", "")   # paste URL từ Zapier
-UPDATE_INTERVAL_MIN = int(os.getenv("UPDATE_INTERVAL_MIN", "5"))
+SPREADSHEET_ID      = os.getenv("SPREADSHEET_ID", "")
+GOOGLE_CREDS_JSON   = os.getenv("GOOGLE_CREDS_JSON", "")
+UPDATE_INTERVAL_MIN = int(os.getenv("UPDATE_INTERVAL_MIN", "1"))
+SHEET_NAME          = os.getenv("SHEET_NAME", "HOSE_Prices")
 
 STOCK_SYMBOLS = os.getenv(
     "STOCK_SYMBOLS",
-    "VNM,VIC,VHM,VCB,BID,CTG,TCB,MWG,FPT,HPG,VRE,MSN,GAS,SAB,PLX"
+    "ACB,AGG,AGM,AGR,ANV,APC,APH,ASM,AST,BCI,BCM,BFC,BHN,BIC,BID,BMC,BMP,BRC,BSI,BTP,BVH,C4G,CAV,CCI,CDC,CDN,CEE,CHP,CIG,CII,CLC,CLG,CMG,CMX,CNG,CRC,CSM,CTD,CTG,CTI,CTP,DAH,DBC,DCL,DCM,DGC,DGW,DHC,DIC,DIG,DLG,DMC,DPM,DQC,DRC,DRH,DRI,DSN,DTA,DTL,DXG,DXS,EIB,ELC,EVE,EVF,EVG,FCN,FIR,FIT,FPT,FRT,FTS,GAB,GAS,GDT,GEG,GEX,GIL,GMD,GVR,HAG,HAH,HAP,HBC,HCM,HDC,HDG,HHV,HID,HII,HMC,HPG,HPX,HQC,HSG,HTG,HTI,HTL,HTV,HU1,HU3,HVN,HVX,IDC,IDI,IJC,IMP,IPA,ITC,ITD,KBC,KDC,KDH,KHG,KMR,KOS,KSB,LAF,LCG,LDG,LEC,LGL,LHG,LIX,LPB,LSS,MBB,MCH,MCP,MDG,MIG,MML,MSB,MSN,MST,MWG,NAF,NAV,NBB,NCT,NKG,NLG,NNT,NPT,NRC,NSC,NT2,NTL,NVB,NVL,NVT,OCB,OGC,OPC,PAC,PC1,PDN,PDR,PET,PGC,PGD,PGI,PGV,PHR,PIT,PLX,PMG,PNJ,POW,PPC,PPI,PSH,PTB,PTC,PTL,PVD,PVP,PVT,QBS,QCG,RCL,REE,ROS,SAB,SAF,SAM,SAV,SBT,SC5,SCD,SCR,SDN,SFC,SFG,SGN,SHB,SHI,SJS,SKG,SLS,SMB,SMC,SPC,SPM,SRC,SRF,SSB,SSC,SSI,ST8,STB,STG,STK,SVC,SVD,SVT,SZC,TAC,TCB,TCD,TCH,TCM,TDC,TDG,TDH,TDM,TDP,TDW,TGG,THG,TIP,TIX,TLD,TLG,TLH,TMP,TMT,TNA,TNH,TNI,TNT,TPC,TPB,TRC,TRS,TSC,TTA,TTB,TTC,TTF,TV2,TVB,TVS,TYA,UDC,UIC,VBH,VCB,VCF,VCI,VCR,VCS,VDS,VGC,VGI,VGS,VHC,VHM,VIC,VID,VIP,VIX,VJC,VKC,VLB,VMD,VNM,VNS,VOS,VPB,VPG,VPH,VPI,VPS,VRC,VRE,VSC,VSH,VSI,VTB,VTC,VTO,WHS,YEG"
 ).split(",")
 
 # ─────────────────────────────────────────────
-# APP
+# LOGGING
 # ─────────────────────────────────────────────
 
-app = FastAPI(title="HOSE Stock Webhook Server")
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler()]
+)
 log = logging.getLogger(__name__)
 
+# ─────────────────────────────────────────────
+# GOOGLE SHEETS
+# ─────────────────────────────────────────────
+
+_sheet_cache = None
+
+def get_sheet():
+    global _sheet_cache
+    if _sheet_cache:
+        return _sheet_cache
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds_dict = json.loads(GOOGLE_CREDS_JSON)
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    client = gspread.authorize(creds)
+    spreadsheet = client.open_by_key(SPREADSHEET_ID)
+    try:
+        sheet = spreadsheet.worksheet(SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        sheet = spreadsheet.add_worksheet(title=SHEET_NAME, rows=500, cols=10)
+        log.info(f"Đã tạo sheet: {SHEET_NAME}")
+    _sheet_cache = sheet
+    return sheet
 
 # ─────────────────────────────────────────────
-# FETCH GIÁ
+# FETCH GIÁ — Yahoo Finance (không bị chặn IP)
 # ─────────────────────────────────────────────
 
-def fetch_price_tcbs(symbol: str) -> dict | None:
-    """Lấy giá từ TCBS (nguồn chính, free, không cần key)."""
-    url = (
-        f"https://apipubaws.tcbs.com.vn/stock-insight/v1/stock/"
-        f"second-chart?ticker={symbol}&type=stock"
-    )
-    try:
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
-        data = r.json()
-        if data.get("data"):
-            d = data["data"][-1]
-            return {
-                "symbol": symbol,
-                "price": d.get("close", 0),
-                "open":  d.get("open", 0),
-                "high":  d.get("high", 0),
-                "low":   d.get("low", 0),
-                "volume": d.get("volume", 0),
-            }
-    except Exception as e:
-        log.warning(f"TCBS {symbol}: {e}")
-    return None
-
-
-def fetch_price_vndirect(symbol: str) -> dict | None:
-    """Backup: VNDirect API."""
-    url = f"https://finfo-api.vndirect.com.vn/v4/stocks?q=codeList:{symbol}&size=1"
-    try:
-        r = requests.get(
-            url,
-            headers={"User-Agent": "Mozilla/5.0", "Referer": "https://www.vndirect.com.vn/"},
-            timeout=8
-        )
-        items = r.json().get("data", [])
-        if items:
-            i = items[0]
-            return {
-                "symbol": symbol,
-                "price":  float(i.get("matchPrice", 0)),
-                "open":   float(i.get("openPrice", 0)),
-                "high":   float(i.get("highPrice", 0)),
-                "low":    float(i.get("lowPrice", 0)),
-                "volume": int(i.get("nmTotalTradedQty", 0)),
-            }
-    except Exception as e:
-        log.warning(f"VNDirect {symbol}: {e}")
-    return None
-
-
-def fetch_all() -> list[dict]:
+def fetch_yahoo_batch(symbols: list[str]) -> list[dict]:
+    """Fetch nhiều mã cùng lúc — Yahoo Finance API, không bị chặn IP nước ngoài."""
+    # Yahoo Finance dùng suffix .VN cho cổ phiếu Việt Nam
+    tickers = ",".join([f"{s}.VN" for s in symbols])
+    url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={tickers}&fields=symbol,regularMarketPrice,regularMarketOpen,regularMarketDayHigh,regularMarketDayLow,regularMarketVolume"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json",
+    }
     results = []
-    for symbol in STOCK_SYMBOLS:
-        data = fetch_price_tcbs(symbol) or fetch_price_vndirect(symbol)
-        if data:
-            results.append(data)
-        time.sleep(0.3)
+    try:
+        r = requests.get(url, headers=headers, timeout=15)
+        data = r.json()
+        quotes = data.get("quoteResponse", {}).get("result", [])
+        for q in quotes:
+            raw_symbol = q.get("symbol", "").replace(".VN", "")
+            price = q.get("regularMarketPrice", 0)
+            if price and price > 0:
+                results.append({
+                    "symbol": raw_symbol,
+                    "price":  float(price),
+                    "open":   float(q.get("regularMarketOpen", 0)),
+                    "high":   float(q.get("regularMarketDayHigh", 0)),
+                    "low":    float(q.get("regularMarketDayLow", 0)),
+                    "volume": int(q.get("regularMarketVolume", 0)),
+                })
+        log.info(f"Yahoo: fetch được {len(results)}/{len(symbols)} mã")
+    except Exception as e:
+        log.error(f"Yahoo batch error: {e}")
     return results
 
 
-# ─────────────────────────────────────────────
-# GỬI DATA ĐẾN ZAPIER
-# ─────────────────────────────────────────────
-
-def push_to_zapier(stocks: list[dict]):
-    """Gửi từng mã CP thành 1 request riêng đến Zapier webhook."""
-    if not ZAPIER_WEBHOOK_URL:
-        log.error("ZAPIER_WEBHOOK_URL chưa được set!")
-        return
-
-    success = 0
-    for stock in stocks:
-        payload = {
-            "symbol":    stock["symbol"],
-            "price":     f"{stock['price']:,.0f}",
-            "open":      f"{stock['open']:,.0f}",
-            "high":      f"{stock['high']:,.0f}",
-            "low":       f"{stock['low']:,.0f}",
-            "volume":    f"{stock['volume']:,}",
-            "timestamp": time.strftime("%d/%m/%Y %H:%M:%S"),
-        }
-        try:
-            r = requests.post(ZAPIER_WEBHOOK_URL, json=payload, timeout=10)
-            if r.status_code == 200:
-                success += 1
-            else:
-                log.warning(f"Zapier {stock['symbol']}: HTTP {r.status_code}")
-        except Exception as e:
-            log.error(f"Push {stock['symbol']}: {e}")
-        time.sleep(0.2)
-
-    log.info(f"✅ Pushed {success}/{len(stocks)} symbols to Zapier")
-
+def fetch_all() -> list[dict]:
+    """Chia batch 50 mã/request để tránh quá dài URL."""
+    all_results = []
+    batch_size = 50
+    for i in range(0, len(STOCK_SYMBOLS), batch_size):
+        batch = STOCK_SYMBOLS[i:i+batch_size]
+        results = fetch_yahoo_batch(batch)
+        all_results.extend(results)
+        time.sleep(0.5)
+    return all_results
 
 # ─────────────────────────────────────────────
-# JOB CHÍNH
+# GHI GOOGLE SHEETS
+# ─────────────────────────────────────────────
+
+HEADERS = ["symbol", "price", "open", "high", "low", "volume", "change_pct", "updated_at"]
+
+def write_to_sheet(stocks: list[dict]):
+    sheet = get_sheet()
+    now   = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    rows  = [HEADERS]
+    for s in stocks:
+        pct = ((s["price"] - s["open"]) / s["open"] * 100) if s["open"] else 0
+        rows.append([
+            s["symbol"],
+            s["price"],
+            s["open"],
+            s["high"],
+            s["low"],
+            s["volume"],
+            f"{pct:+.2f}%",
+            now,
+        ])
+    sheet.clear()
+    sheet.update("A1", rows)
+    log.info(f"✅ Ghi {len(stocks)} mã vào Sheets lúc {now}")
+
+# ─────────────────────────────────────────────
+# KIỂM TRA GIỜ GIAO DỊCH
+# ─────────────────────────────────────────────
+
+def is_trading_hours() -> bool:
+    now = datetime.now()
+    if now.weekday() > 4:
+        return False
+    if now.hour < 2 or now.hour >= 8:   # UTC+0: 9:00-15:00 ICT = 2:00-8:00 UTC
+        return False
+    return True
+
+# ─────────────────────────────────────────────
+# JOB
 # ─────────────────────────────────────────────
 
 def run_job():
-    log.info("⏱ Running scheduled stock fetch...")
+    if not is_trading_hours():
+        log.info("Ngoài giờ giao dịch — bỏ qua.")
+        return
+    log.info(f"⏱ Fetch {len(STOCK_SYMBOLS)} mã...")
     stocks = fetch_all()
     if stocks:
-        push_to_zapier(stocks)
+        write_to_sheet(stocks)
     else:
         log.warning("Không fetch được dữ liệu.")
 
-
 # ─────────────────────────────────────────────
-# SCHEDULER (tự chạy không cần Zapier trigger)
+# SCHEDULER + APP
 # ─────────────────────────────────────────────
 
-scheduler = BackgroundScheduler()
+scheduler = BackgroundScheduler(timezone="UTC")
 scheduler.add_job(run_job, "interval", minutes=UPDATE_INTERVAL_MIN)
 scheduler.start()
 
-
-# ─────────────────────────────────────────────
-# API ENDPOINTS
-# ─────────────────────────────────────────────
+app = FastAPI(title="HOSE Stock Direct Writer")
 
 @app.get("/")
 def root():
-    return {"status": "running", "symbols": STOCK_SYMBOLS}
-
+    return {"status": "running", "symbols": len(STOCK_SYMBOLS), "interval_min": UPDATE_INTERVAL_MIN}
 
 @app.get("/fetch")
-def manual_fetch(background_tasks: BackgroundTasks):
-    """Trigger thủ công — Zapier Schedule cũng gọi endpoint này."""
-    background_tasks.add_task(run_job)
-    return JSONResponse({"status": "fetching", "symbols": len(STOCK_SYMBOLS)})
-
+def manual_fetch():
+    threading.Thread(target=run_job).start()
+    return JSONResponse({"status": "fetching", "count": len(STOCK_SYMBOLS)})
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
-
+    return {"status": "ok", "time": datetime.now().isoformat()}
