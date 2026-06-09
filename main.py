@@ -173,3 +173,4 @@ def manual_fetch(background_tasks: BackgroundTasks):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
