@@ -1,5 +1,5 @@
 """
-HOSE Stock Tracker — SSI API
+HOSE Stock Tracker — CAFEF API
 """
 
 import os, time, logging, json, threading
@@ -52,52 +52,49 @@ def get_sheet(name: str):
         return s
 
 # ─────────────────────────────────────────────
-# FETCH GIÁ — SSI API (không bị chặn IP)
+# FETCH GIÁ — CAFEF (không bị chặn IP nước ngoài)
 # ─────────────────────────────────────────────
 
-def fetch_ssi_batch(symbols: list[str]) -> list[dict]:
-    """SSI Securities API — lấy giá theo batch, không bị chặn IP nước ngoài."""
-    results = []
-    # SSI API lấy toàn bộ mã HOSE trong 1 request
-    url = "https://iboard-query.ssi.com.vn/v2/stock/exchange/HOSE/snapshot"
+def fetch_cafef() -> list[dict]:
+    """CAFEF API — lấy toàn bộ HOSE, không bị chặn IP nước ngoài."""
+    url = "https://s.cafef.vn/Handlers/PagingHandler.ashx?type=0&exchange=HOSE&index=0&count=1000&refer="
     headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json",
-        "Origin": "https://iboard.ssi.com.vn",
-        "Referer": "https://iboard.ssi.com.vn/",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept": "application/json, text/javascript, */*",
+        "Referer": "https://s.cafef.vn/",
     }
+    results = []
+    symbol_set = set(STOCK_SYMBOLS)
     try:
         r = requests.get(url, headers=headers, timeout=15)
         data = r.json()
-        items = data.get("data", [])
-        symbol_set = set(symbols)
+        items = data.get("Data", {}).get("Data", [])
         for item in items:
-            sym = item.get("ticker", "")
+            sym   = item.get("Symbol", "").strip()
             if sym not in symbol_set:
                 continue
-            price = float(item.get("lastPrice", 0) or 0)
-            open_ = float(item.get("openPrice", 0) or 0)
-            high  = float(item.get("highPrice", 0) or 0)
-            low   = float(item.get("lowPrice", 0) or 0)
-            vol   = int(item.get("totalVolume", 0) or 0)
+            price = float(item.get("ClosePrice", 0) or item.get("MatchPrice", 0) or 0)
+            open_ = float(item.get("OpenPrice", 0) or 0)
+            high  = float(item.get("HighPrice", 0) or 0)
+            low   = float(item.get("LowPrice", 0) or 0)
+            vol   = int(item.get("TotalVol", 0) or 0)
             if price > 0:
                 results.append({
                     "symbol": sym,
-                    "price":  price,
-                    "open":   open_,
-                    "high":   high,
-                    "low":    low,
+                    "price":  price * 1000,  # CAFEF trả về đơn vị nghìn đồng
+                    "open":   open_ * 1000,
+                    "high":   high  * 1000,
+                    "low":    low   * 1000,
                     "volume": vol,
                 })
-        log.info(f"SSI: fetch được {len(results)}/{len(symbols)} mã")
+        log.info(f"CAFEF: fetch được {len(results)} mã")
     except Exception as e:
-        log.error(f"SSI error: {e}")
+        log.error(f"CAFEF error: {e}")
     return results
 
 
 def fetch_all() -> list[dict]:
-    # SSI trả về toàn bộ HOSE trong 1 request — không cần batch
-    return fetch_ssi_batch(STOCK_SYMBOLS)
+    return fetch_cafef()
 
 # ─────────────────────────────────────────────
 # GHI REALTIME
@@ -130,10 +127,8 @@ def col_num_to_letter(n: int) -> str:
 def write_close_prices(stocks: list[dict]):
     sheet  = get_sheet(CLOSE_SHEET_NAME)
     today  = datetime.now(ICT).strftime("%d/%m/%Y")
-    log.info(f"📌 Lưu giá đóng cửa ngày {today}...")
     existing = sheet.get_all_values()
     symbol_map = {s["symbol"]: s["price"] for s in stocks}
-
     if not existing:
         rows = [["Mã CP", today]]
         for sym in STOCK_SYMBOLS:
@@ -141,19 +136,13 @@ def write_close_prices(stocks: list[dict]):
         sheet.update("A1", rows)
         log.info(f"✅ Close: tạo mới {len(stocks)} mã ngày {today}")
         return
-
-    header_row = existing[0]
-    if today in header_row:
+    if today in existing[0]:
         log.info(f"Ngày {today} đã có — bỏ qua.")
         return
-
-    new_col = len(header_row) + 1
-    col_letter = col_num_to_letter(new_col)
+    col_letter = col_num_to_letter(len(existing[0]) + 1)
     sheet.update(f"{col_letter}1", [[today]])
     existing_symbols = [row[0] for row in existing[1:] if row]
-    price_col = [[symbol_map.get(sym, "")] for sym in existing_symbols]
-    if price_col:
-        sheet.update(f"{col_letter}2", price_col)
+    sheet.update(f"{col_letter}2", [[symbol_map.get(sym, "")] for sym in existing_symbols])
     log.info(f"✅ Close: thêm cột {today} ({len(stocks)} mã)")
 
 # ─────────────────────────────────────────────
