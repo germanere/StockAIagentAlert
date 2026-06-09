@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: hose-stock-webhook
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: ZAPIER_WEBHOOK_URL
+        sync: false          # điền tay trong Render dashboard
+      - key: STOCK_SYMBOLS
+        value: VNM,VIC,VHM,VCB,BID,CTG,TCB,MWG,FPT,HPG,VRE,MSN,GAS,SAB,PLX
+      - key: UPDATE_INTERVAL_MIN
+        value: "5"
