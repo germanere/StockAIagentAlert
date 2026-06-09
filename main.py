@@ -1,8 +1,5 @@
 """
-HOSE Stock Tracker — Direct Google Sheets Writer
-==================================================
-- Sheet HOSE_Prices: cập nhật giá realtime mỗi 1 phút
-- Sheet HOSE_Close: lưu giá đóng cửa mỗi ngày lúc 15:00 ICT
+HOSE Stock Tracker — SSI API
 """
 
 import os, time, logging, json, threading
@@ -14,10 +11,6 @@ from google.oauth2.service_account import Credentials
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-
-# ─────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────
 
 SPREADSHEET_ID      = os.getenv("SPREADSHEET_ID", "")
 GOOGLE_CREDS_JSON   = os.getenv("GOOGLE_CREDS_JSON", "")
@@ -31,15 +24,7 @@ STOCK_SYMBOLS = os.getenv(
     "ACB,AGG,AGM,AGR,ANV,APC,APH,ASM,AST,BCI,BCM,BFC,BHN,BIC,BID,BMC,BMP,BRC,BSI,BTP,BVH,C4G,CAV,CCI,CDC,CDN,CEE,CHP,CIG,CII,CLC,CLG,CMG,CMX,CNG,CRC,CSM,CTD,CTG,CTI,CTP,DAH,DBC,DCL,DCM,DGC,DGW,DHC,DIC,DIG,DLG,DMC,DPM,DQC,DRC,DRH,DRI,DSN,DTA,DTL,DXG,DXS,EIB,ELC,EVE,EVF,EVG,FCN,FIR,FIT,FPT,FRT,FTS,GAB,GAS,GDT,GEG,GEX,GIL,GMD,GVR,HAG,HAH,HAP,HBC,HCM,HDC,HDG,HHV,HID,HII,HMC,HPG,HPX,HQC,HSG,HTG,HTI,HTL,HTV,HU1,HU3,HVN,HVX,IDC,IDI,IJC,IMP,IPA,ITC,ITD,KBC,KDC,KDH,KHG,KMR,KOS,KSB,LAF,LCG,LDG,LEC,LGL,LHG,LIX,LPB,LSS,MBB,MCH,MCP,MDG,MIG,MML,MSB,MSN,MST,MWG,NAF,NAV,NBB,NCT,NKG,NLG,NNT,NPT,NRC,NSC,NT2,NTL,NVB,NVL,NVT,OCB,OGC,OPC,PAC,PC1,PDN,PDR,PET,PGC,PGD,PGI,PGV,PHR,PIT,PLX,PMG,PNJ,POW,PPC,PPI,PSH,PTB,PTC,PTL,PVD,PVP,PVT,QBS,QCG,RCL,REE,ROS,SAB,SAF,SAM,SAV,SBT,SC5,SCD,SCR,SDN,SFC,SFG,SGN,SHB,SHI,SJS,SKG,SLS,SMB,SMC,SPC,SPM,SRC,SRF,SSB,SSC,SSI,ST8,STB,STG,STK,SVC,SVD,SVT,SZC,TAC,TCB,TCD,TCH,TCM,TDC,TDG,TDH,TDM,TDP,TDW,TGG,THG,TIP,TIX,TLD,TLG,TLH,TMP,TMT,TNA,TNH,TNI,TNT,TPC,TPB,TRC,TRS,TSC,TTA,TTB,TTC,TTF,TV2,TVB,TVS,TYA,UDC,UIC,VBH,VCB,VCF,VCI,VCR,VCS,VDS,VGC,VGI,VGS,VHC,VHM,VIC,VID,VIP,VIX,VJC,VKC,VLB,VMD,VNM,VNS,VOS,VPB,VPG,VPH,VPI,VPS,VRC,VRE,VSC,VSH,VSI,VTB,VTC,VTO,WHS,YEG"
 ).split(",")
 
-# ─────────────────────────────────────────────
-# LOGGING
-# ─────────────────────────────────────────────
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler()]
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────
@@ -52,67 +37,70 @@ def get_client():
     global _client_cache
     if _client_cache:
         return _client_cache
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds_dict = json.loads(GOOGLE_CREDS_JSON)
-    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+    creds = Credentials.from_service_account_info(json.loads(GOOGLE_CREDS_JSON), scopes=scopes)
     _client_cache = gspread.authorize(creds)
     return _client_cache
 
 def get_sheet(name: str):
-    spreadsheet = get_client().open_by_key(SPREADSHEET_ID)
+    ss = get_client().open_by_key(SPREADSHEET_ID)
     try:
-        return spreadsheet.worksheet(name)
+        return ss.worksheet(name)
     except gspread.WorksheetNotFound:
-        sheet = spreadsheet.add_worksheet(title=name, rows=500, cols=100)
-        log.info(f"Đã tạo sheet: {name}")
-        return sheet
+        s = ss.add_worksheet(title=name, rows=500, cols=100)
+        log.info(f"Tạo sheet: {name}")
+        return s
 
 # ─────────────────────────────────────────────
-# FETCH GIÁ — Yahoo Finance
+# FETCH GIÁ — SSI API (không bị chặn IP)
 # ─────────────────────────────────────────────
 
-def fetch_yahoo_batch(symbols: list[str]) -> list[dict]:
-    tickers = ",".join([f"{s}.VN" for s in symbols])
-    url = (
-        f"https://query1.finance.yahoo.com/v7/finance/quote"
-        f"?symbols={tickers}&fields=symbol,regularMarketPrice,regularMarketOpen,"
-        f"regularMarketDayHigh,regularMarketDayLow,regularMarketVolume"
-    )
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+def fetch_ssi_batch(symbols: list[str]) -> list[dict]:
+    """SSI Securities API — lấy giá theo batch, không bị chặn IP nước ngoài."""
     results = []
+    # SSI API lấy toàn bộ mã HOSE trong 1 request
+    url = "https://iboard-query.ssi.com.vn/v2/stock/exchange/HOSE/snapshot"
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json",
+        "Origin": "https://iboard.ssi.com.vn",
+        "Referer": "https://iboard.ssi.com.vn/",
+    }
     try:
         r = requests.get(url, headers=headers, timeout=15)
-        quotes = r.json().get("quoteResponse", {}).get("result", [])
-        for q in quotes:
-            symbol = q.get("symbol", "").replace(".VN", "")
-            price  = q.get("regularMarketPrice", 0)
-            if price and price > 0:
+        data = r.json()
+        items = data.get("data", [])
+        symbol_set = set(symbols)
+        for item in items:
+            sym = item.get("ticker", "")
+            if sym not in symbol_set:
+                continue
+            price = float(item.get("lastPrice", 0) or 0)
+            open_ = float(item.get("openPrice", 0) or 0)
+            high  = float(item.get("highPrice", 0) or 0)
+            low   = float(item.get("lowPrice", 0) or 0)
+            vol   = int(item.get("totalVolume", 0) or 0)
+            if price > 0:
                 results.append({
-                    "symbol": symbol,
-                    "price":  float(price),
-                    "open":   float(q.get("regularMarketOpen", 0)),
-                    "high":   float(q.get("regularMarketDayHigh", 0)),
-                    "low":    float(q.get("regularMarketDayLow", 0)),
-                    "volume": int(q.get("regularMarketVolume", 0)),
+                    "symbol": sym,
+                    "price":  price,
+                    "open":   open_,
+                    "high":   high,
+                    "low":    low,
+                    "volume": vol,
                 })
+        log.info(f"SSI: fetch được {len(results)}/{len(symbols)} mã")
     except Exception as e:
-        log.error(f"Yahoo error: {e}")
+        log.error(f"SSI error: {e}")
     return results
 
 
 def fetch_all() -> list[dict]:
-    all_results = []
-    for i in range(0, len(STOCK_SYMBOLS), 50):
-        batch = STOCK_SYMBOLS[i:i+50]
-        all_results.extend(fetch_yahoo_batch(batch))
-        time.sleep(0.5)
-    return all_results
+    # SSI trả về toàn bộ HOSE trong 1 request — không cần batch
+    return fetch_ssi_batch(STOCK_SYMBOLS)
 
 # ─────────────────────────────────────────────
-# GHI REALTIME SHEET
+# GHI REALTIME
 # ─────────────────────────────────────────────
 
 HEADERS = ["symbol", "price", "open", "high", "low", "volume", "change_pct", "updated_at"]
@@ -123,74 +111,50 @@ def write_realtime(stocks: list[dict]):
     rows  = [HEADERS]
     for s in stocks:
         pct = ((s["price"] - s["open"]) / s["open"] * 100) if s["open"] else 0
-        rows.append([
-            s["symbol"], s["price"], s["open"],
-            s["high"], s["low"], s["volume"],
-            f"{pct:+.2f}%", now,
-        ])
+        rows.append([s["symbol"], s["price"], s["open"], s["high"], s["low"], s["volume"], f"{pct:+.2f}%", now])
     sheet.clear()
     sheet.update("A1", rows)
     log.info(f"✅ Realtime: ghi {len(stocks)} mã lúc {now}")
 
 # ─────────────────────────────────────────────
-# GHI CLOSE PRICE SHEET
-# Cấu trúc: cột A = mã CP, mỗi ngày thêm 1 cột mới
-# Hàng 1 = header ngày (vd: 09/06/2025)
+# GHI GIÁ ĐÓNG CỬA
 # ─────────────────────────────────────────────
 
+def col_num_to_letter(n: int) -> str:
+    result = ""
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        result = chr(65 + r) + result
+    return result
+
 def write_close_prices(stocks: list[dict]):
-    sheet   = get_sheet(CLOSE_SHEET_NAME)
-    today   = datetime.now(ICT).strftime("%d/%m/%Y")
+    sheet  = get_sheet(CLOSE_SHEET_NAME)
+    today  = datetime.now(ICT).strftime("%d/%m/%Y")
     log.info(f"📌 Lưu giá đóng cửa ngày {today}...")
-
-    # Đọc dữ liệu hiện tại
     existing = sheet.get_all_values()
-
-    if not existing:
-        # Sheet trống — tạo mới hoàn toàn
-        header_row = ["Mã CP", today]
-        symbol_map = {s["symbol"]: s["price"] for s in stocks}
-        rows = [header_row]
-        for symbol in STOCK_SYMBOLS:
-            rows.append([symbol, symbol_map.get(symbol, "")])
-        sheet.update("A1", rows)
-        log.info(f"✅ Close: tạo mới với {len(stocks)} mã ngày {today}")
-        return
-
-    # Sheet đã có dữ liệu
-    header_row = existing[0]  # ["Mã CP", "08/06/2025", "09/06/2025", ...]
-
-    # Kiểm tra ngày hôm nay đã có chưa
-    if today in header_row:
-        log.info(f"Ngày {today} đã có trong Close sheet — bỏ qua.")
-        return
-
-    # Thêm cột mới cho ngày hôm nay
-    new_col_index = len(header_row) + 1  # cột tiếp theo (1-indexed)
-    col_letter    = col_num_to_letter(new_col_index)
-
-    # Map symbol → price
     symbol_map = {s["symbol"]: s["price"] for s in stocks}
 
-    # Ghi header ngày mới
-    sheet.update(f"{col_letter}1", [[today]])
+    if not existing:
+        rows = [["Mã CP", today]]
+        for sym in STOCK_SYMBOLS:
+            rows.append([sym, symbol_map.get(sym, "")])
+        sheet.update("A1", rows)
+        log.info(f"✅ Close: tạo mới {len(stocks)} mã ngày {today}")
+        return
 
-    # Ghi giá theo đúng thứ tự symbol ở cột A
+    header_row = existing[0]
+    if today in header_row:
+        log.info(f"Ngày {today} đã có — bỏ qua.")
+        return
+
+    new_col = len(header_row) + 1
+    col_letter = col_num_to_letter(new_col)
+    sheet.update(f"{col_letter}1", [[today]])
     existing_symbols = [row[0] for row in existing[1:] if row]
     price_col = [[symbol_map.get(sym, "")] for sym in existing_symbols]
     if price_col:
         sheet.update(f"{col_letter}2", price_col)
-
     log.info(f"✅ Close: thêm cột {today} ({len(stocks)} mã)")
-
-
-def col_num_to_letter(n: int) -> str:
-    """Chuyển số cột sang chữ cái (1=A, 26=Z, 27=AA...)"""
-    result = ""
-    while n > 0:
-        n, remainder = divmod(n - 1, 26)
-        result = chr(65 + remainder) + result
-    return result
 
 # ─────────────────────────────────────────────
 # JOBS
@@ -205,38 +169,26 @@ def job_realtime():
         log.warning("Không fetch được dữ liệu.")
 
 def job_close():
-    """Chạy lúc 15:05 ICT mỗi ngày T2-T6 — lưu giá đóng cửa."""
-    now = datetime.now(ICT)
-    if now.weekday() > 4:
+    if datetime.now(ICT).weekday() > 4:
         return
-    log.info("📌 Bắt đầu lưu giá đóng cửa...")
     stocks = fetch_all()
     if stocks:
         write_close_prices(stocks)
 
 # ─────────────────────────────────────────────
-# SCHEDULER
+# SCHEDULER + APP
 # ─────────────────────────────────────────────
 
 scheduler = BackgroundScheduler(timezone=ICT)
 scheduler.add_job(job_realtime, "interval", minutes=UPDATE_INTERVAL_MIN, id="realtime")
-scheduler.add_job(job_close,    "cron",     hour=15, minute=5, day_of_week="mon-fri", id="close")
+scheduler.add_job(job_close, "cron", hour=15, minute=5, day_of_week="mon-fri", id="close")
 scheduler.start()
-
-# ─────────────────────────────────────────────
-# FASTAPI
-# ─────────────────────────────────────────────
 
 app = FastAPI(title="HOSE Stock Direct Writer")
 
 @app.get("/")
 def root():
-    return {
-        "status": "running",
-        "symbols": len(STOCK_SYMBOLS),
-        "interval_min": UPDATE_INTERVAL_MIN,
-        "close_price_time": "15:05 ICT mỗi ngày T2-T6",
-    }
+    return {"status": "running", "symbols": len(STOCK_SYMBOLS), "interval_min": UPDATE_INTERVAL_MIN}
 
 @app.get("/fetch")
 def manual_fetch():
@@ -245,7 +197,6 @@ def manual_fetch():
 
 @app.get("/close")
 def manual_close():
-    """Test lưu giá đóng cửa thủ công."""
     threading.Thread(target=job_close).start()
     return JSONResponse({"status": "saving close prices"})
 
